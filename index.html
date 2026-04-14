@@ -656,10 +656,10 @@ body::after{content:'';position:fixed;inset:0;background:repeating-linear-gradie
         </div>
         <div class="sgrp">
           <div class="sgt">🧠 INTELLIGENCE</div>
-          <div class="srow"><div><div class="slbl">Win Threshold</div><div class="ssub">PnL % to count as a win for ML training</div></div><div class="sinp"><button class="sbtn" onclick="adj('winThresh',-5)">-</button><span class="sval" id="sv-wt">30%</span><button class="sbtn" onclick="adj('winThresh',+5)">+</button></div></div>
+          <div class="srow"><div><div class="slbl">Win Threshold</div><div class="ssub">PnL % to count as a win for ML training</div></div><div class="sinp"><button class="sbtn" onclick="adj('winThresh',-5)">-</button><span class="sval" id="sv-wt">5%</span><button class="sbtn" onclick="adj('winThresh',+5)">+</button></div></div>
           <div class="srow"><div><div class="slbl">Daily Profit Target</div><div class="ssub">SOL profit → pause trading to protect gains</div></div><div class="sinp"><button class="sbtn" onclick="adj('dailyTarget',-1)">-</button><span class="sval" id="sv-dt">5 SOL</span><button class="sbtn" onclick="adj('dailyTarget',+1)">+</button></div></div>
           <div class="srow"><div><div class="slbl">ML Rug Gate</div><div class="ssub">Max rug probability % before hard block</div></div><div class="sinp"><button class="sbtn" onclick="adj('rugGate',-5)">-</button><span class="sval" id="sv-rg">40%</span><button class="sbtn" onclick="adj('rugGate',+5)">+</button></div></div>
-          <div class="srow"><div><div class="slbl">Grandfather PnL</div><div class="ssub">Single-trade % → instant wallet TRUSTED</div></div><div class="sinp"><button class="sbtn" onclick="adj('grandfather',-50)">-</button><span class="sval" id="sv-gf">250%</span><button class="sbtn" onclick="adj('grandfather',+50)">+</button></div></div>
+          <div class="srow"><div><div class="slbl">Grandfather PnL</div><div class="ssub">Single-trade % → instant wallet TRUSTED</div></div><div class="sinp"><button class="sbtn" onclick="adj('grandfather',-50)">-</button><span class="sval" id="sv-gf">100%</span><button class="sbtn" onclick="adj('grandfather',+50)">+</button></div></div>
           <div class="srow"><div><div class="slbl">EV Minimum</div><div class="ssub">Expected value floor (below = skip)</div></div><div class="sinp"><button class="sbtn" onclick="adj('evMin',-2)">-</button><span class="sval" id="sv-ev">8%</span><button class="sbtn" onclick="adj('evMin',+2)">+</button></div></div>
         </div>
         <div class="sgrp">
@@ -1703,7 +1703,7 @@ const REGIME_ADAPTIVE = (() => {
   return { adapt, stats };
 })();
 
-const CFG={size:50,minsize:5,res:10,cbLimit:5,daily:50,maxpos:5,tipLamports:500000,jito:true,skipPreflight:true,mirrorExit:true,kelly:true,pumpForecast:true,shadowTrack:true,hardStop:-15,trailDrop:-25,takeProfit:100,maxHoldMin:10,sessionDD:-20,requireGmgn:true,winThresh:30,dailyTarget:5,rugGate:40,grandfather:250,evMin:8};
+const CFG={size:50,minsize:5,res:10,cbLimit:5,daily:50,maxpos:5,tipLamports:500000,jito:true,skipPreflight:true,mirrorExit:true,kelly:true,pumpForecast:true,shadowTrack:true,hardStop:-15,trailDrop:-25,takeProfit:100,maxHoldMin:10,sessionDD:-20,requireGmgn:true,winThresh:5,dailyTarget:5,rugGate:40,grandfather:100,evMin:8};
 let WIN_THRESHOLD_PCT = CFG.winThresh;
 let _gmgnFirstPassDone = false; // GATE: no trades until GMGN ranks wallets once
 // §GMGN_PERSIST: If we restored ranked wallets from localStorage, bypass the GMGN gate
@@ -10295,15 +10295,15 @@ const PUMP_FORECAST = (() => {
 // PERSISTENCE: localStorage (survives refresh, cleared on clearSiteData)
 // ══════════════════════════════════════════════════════════════════════════════
 const WALLET_PROBATION = (() => {
-  const DB_KEY = 'mchpai_probation_v1';
+  const DB_KEY = 'mchpai_probation_v2'; // §FIX: v2 — discards v1 data scored at impossible 30% win threshold
   const REQUIRED_TRADES = 5;     // min shadow trades before decision
-  const MIN_WIN_RATE = 0.75;     // 75% WR to graduate
-  const MIN_AVG_PNL = 20;        // 20% avg gross PnL per trade
-  const MAX_CONSEC_LOSS = 1;     // max consecutive losses allowed
+  const MIN_WIN_RATE = 0.50;     // §FIX: 50% WR to graduate (was 75% — impossible at old win threshold)
+  const MIN_AVG_PNL = 0;         // §FIX: Any positive avg PnL (was 20% — too strict for copy trading)
+  const MAX_CONSEC_LOSS = 3;     // §FIX: Allow 3 consecutive losses (was 1 — too brittle)
   const DEMOTION_WINDOW = 10;    // review last N live trades
-  const DEMOTION_WR = 0.50;      // demote if live WR drops below this
+  const DEMOTION_WR = 0.30;      // §FIX: demote if live WR drops below 30% (was 50%)
   const REPROVE_TRADES = 3;      // trades needed to re-prove after suspension
-
+  const PROBATION_WIN_THRESH = 0; // §FIX: For probation, ANY profit = win (separate from ML training threshold)
   // walletAddr → {
   //   status: 'PROBATION'|'TRUSTED'|'FAILED'|'SUSPENDED',
   //   shadow: {wins, losses, trades:[{pnlPct, mint, ts}], consecLosses},
@@ -10332,12 +10332,17 @@ const WALLET_PROBATION = (() => {
   // Initialize wallet if not tracked
   function ensureWallet(addr) {
     if (!_wallets[addr]) {
+      // §FIX: S-tier and A-tier wallets are HAND-CURATED — auto-TRUSTED
+      // Probation is for auto-discovered unknowns, not your vetted list
+      const _w = typeof WMAP !== 'undefined' ? WMAP[addr] : null;
+      const _isCurated = _w && (_w.tier === 'S' || _w.tier === 'A');
       _wallets[addr] = {
-        status: 'PROBATION',
+        status: _isCurated ? 'TRUSTED' : 'PROBATION',
         shadow: { wins: 0, losses: 0, trades: [], consecLosses: 0 },
         live: { wins: 0, losses: 0, trades: [] },
-        promotedAt: 0, failedAt: 0, suspendedAt: 0
+        promotedAt: _isCurated ? Date.now() : 0, failedAt: 0, suspendedAt: 0
       };
+      if (_isCurated) _stats.trusted++;
     }
     return _wallets[addr];
   }
@@ -10345,12 +10350,29 @@ const WALLET_PROBATION = (() => {
   // ── Core status check ──
   function isTrusted(addr) {
     const w = _wallets[addr];
+    // §FIX: S/A tier wallets always trusted even if not in probation DB
+    if (!w) {
+      const _w = typeof WMAP !== 'undefined' ? WMAP[addr] : null;
+      if (_w && (_w.tier === 'S' || _w.tier === 'A')) return true;
+    }
     return w && w.status === 'TRUSTED';
   }
 
   function getStatus(addr) {
     const w = _wallets[addr];
-    if (!w) return 'PROBATION'; // new wallet = probation
+    // §FIX: S/A tier wallets ALWAYS TRUSTED — override any saved state
+    // They may have been saved as PROBATION/FAILED from when thresholds were too strict
+    const _wm = typeof WMAP !== 'undefined' ? WMAP[addr] : null;
+    if (_wm && (_wm.tier === 'S' || _wm.tier === 'A')) {
+      // Also fix the stored status so it persists
+      if (w && w.status !== 'TRUSTED') {
+        w.status = 'TRUSTED';
+        w.promotedAt = Date.now();
+        save();
+      }
+      return 'TRUSTED';
+    }
+    if (!w) return 'PROBATION'; // unknown wallet = probation
     return w.status;
   }
 
@@ -10399,7 +10421,9 @@ const WALLET_PROBATION = (() => {
       return;
     }
 
-    const isWin = pnlPct >= WIN_THRESHOLD_PCT;
+    // §FIX: For probation, ANY profit = win. WIN_THRESHOLD_PCT (30%) is for ML training only.
+    // A shadow trade at +15% is still profitable and should count as a win for wallet qualification.
+    const isWin = pnlPct > PROBATION_WIN_THRESH;
     if (isWin) {
       w.shadow.wins++;
       w.shadow.consecLosses = 0;
@@ -12663,6 +12687,19 @@ function onMsg(m){
   if(_recentLossMints.has(mint)||_recentBuyMints.has(mint))return;
   // §BLEED#20: 60s cooldown per wallet after loss
   if(S._walletCooldowns&&S._walletCooldowns[w.addr]&&(Date.now()-S._walletCooldowns[w.addr])<60000)return;
+  // §3-STRIKE: Block wallet after 3 losses — blunder protection
+  // Tracks via wstats.losses. Wallet is dead for this session after 3 Ls.
+  // Shadow-tracks instead so the wallet can earn redemption via SHADOW_TRACKER.
+  const _ws3 = S.wstats[w.rank];
+  if (_ws3 && _ws3.losses >= 3) {
+    if (!SHADOW_TRACKER.shouldAllowWallet(w.addr)) {
+      SHADOW_TRACKER.open(mint, sym, w, solAmt, tokAmt, '3STRIKE_' + _ws3.losses + 'L');
+      addFeed('info', '🚫 3-STRIKE: W#' + w.rank + ' [' + w.tier + '] ' + sym,
+        _ws3.losses + ' losses — blocked (shadowing)');
+      return;
+    }
+    addFeed('ml', '👻 3-STRIKE OVERRIDE: W#' + w.rank + ' ' + sym, 'Shadow-proven despite ' + _ws3.losses + ' losses');
+  }
   _recentBuyMints.set(mint, Date.now()); // §FIX: Record BEFORE filters — prevents retry loop when intermediate gates block
   if(w.gmgnUpdated&&w.wr7d<0.35){
     if(!SHADOW_TRACKER.shouldAllowWallet(w.addr)){
