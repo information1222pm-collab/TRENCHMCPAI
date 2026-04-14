@@ -6382,9 +6382,10 @@ const EXIT_PRIORITY = (() => {
         feedType:'sell', feedMsg:'🚨 EMERGENCY '+_emMin+'MIN EXIT: '+pos.sym+' pnl='+pnlPct.toFixed(1)+'%'};
     }
 
-    // C0b: §FIX: FAST STALE EXIT — 30s for live positions (was 90s for all)
-    // Live trades with zero ticks after 30s are confirmed dead
-    if (pos.status !== 'paper' && pos.priceTickCount === 0 && (now - pos.entryTime) > 30000) {
+    // C0b: §FIX: FAST STALE EXIT — 30s for live positions with ZERO price data from ANY source
+    // If Jupiter PRICE_ENGINE is providing prices, the position is NOT stale
+    const _hasAnyPrice = pos.currentPrice > 0 && pos.entryPrice > 0 && pos._lastTickAt && (now - pos._lastTickAt) < 10000;
+    if (pos.status !== 'paper' && pos.priceTickCount === 0 && !_hasAnyPrice && (now - pos.entryTime) > 30000) {
       return {exit:true, reason:'stale_live_30s', priority:'CRITICAL',
         feedType:'warn', feedMsg:'⏰ STALE LIVE: '+pos.sym+' — 0 ticks 30s'};
     }
@@ -6442,8 +6443,8 @@ const EXIT_PRIORITY = (() => {
         pos._dynTrail = Math.max(-50, pos._dynTrail * ep.tightenFactor);
       }
     }
-    // H1: Stale position (no ticks for 90s)
-    if (pos.priceTickCount === 0 && (now - pos.entryTime) > 90000) {
+    // H1: Stale position (no ticks from ANY source for 90s)
+    if (pos.priceTickCount === 0 && !_hasAnyPrice && (now - pos.entryTime) > 90000) {
       return {exit:true, reason:'stale_no_ticks', priority:'HIGH',
         feedType:'warn', feedMsg:'⏰ STALE: '+pos.sym+' — no ticks 90s'};
     }
@@ -12155,6 +12156,101 @@ async function _bootTrader(label) {
   renderWallets();
   initAllWS(); // §INTEGRATION: starts PumpPortal + DexScreener WS
   setInterval(posMonitor,250);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // §PRICE_ENGINE — Aggressive multi-source real-time pricing for ALL positions
+  // Problem: PumpPortal WS only fires on trades. No trades = 0 ticks = 0.0% PnL.
+  // Fix: Poll Jupiter Price API every 2s for ALL held positions regardless of
+  // PumpPortal tick status. Jupiter aggregates ALL DEX liquidity sources.
+  // Also re-subscribes PumpPortal WS for any position without ticks.
+  // ═══════════════════════════════════════════════════════════════════════════
+  let _pricePollerRunning = false;
+  let _pricePollerCycle = 0;
+  const _solMint = 'So11111111111111111111111111111111111111112';
+  let _cachedSolPrice = 0;
+  let _cachedSolPriceAt = 0;
+
+  async function _pricePoll() {
+    if (_pricePollerRunning) return;
+    const entries = Object.entries(S.positions);
+    if (!entries.length) return;
+    _pricePollerRunning = true;
+    _pricePollerCycle++;
+    const now = Date.now();
+
+    try {
+      // Collect ALL held position mints (not just stale ones)
+      const mintList = entries.map(([mint]) => mint).slice(0, 25);
+
+      // Re-subscribe stale positions to PumpPortal every cycle
+      for (const [mint, pos] of entries) {
+        const tickAge = pos._lastTickAt ? (now - pos._lastTickAt) : (now - pos.entryTime);
+        if (tickAge > 4000) { // 4s without a tick = re-subscribe
+          if (S.ws?.readyState === 1) S.ws.send(WS_SUB_TOK(mint));
+          if (S.ws2?.readyState === 1) S.ws2.send(WS_SUB_TOK(mint));
+        }
+      }
+
+      // Batch Jupiter price query for ALL held positions + SOL
+      const ids = [...mintList, _solMint].join(',');
+      const r = await fetch('https://api.jup.ag/price/v2?ids=' + ids, {
+        signal: AbortSignal.timeout(3000)
+      });
+      if (!r.ok) { _pricePollerRunning = false; return; }
+      const data = await r.json();
+
+      // Cache SOL price (needed to convert USD→SOL)
+      const solPriceRaw = parseFloat(data?.data?.[_solMint]?.price || '0');
+      if (solPriceRaw > 0) { _cachedSolPrice = solPriceRaw; _cachedSolPriceAt = now; }
+      const solPrice = _cachedSolPrice;
+      if (!solPrice || solPrice <= 0) { _pricePollerRunning = false; return; }
+
+      let updated = 0;
+      for (const [mint, pos] of entries) {
+        const tokenData = data?.data?.[mint];
+        if (!tokenData || !tokenData.price) continue;
+        const tokenUSD = parseFloat(tokenData.price);
+        if (tokenUSD <= 0) continue;
+
+        // Convert USD price to SOL-per-token (matching pos.entryPrice format)
+        const tokenPriceInSOL = tokenUSD / solPrice;
+        if (tokenPriceInSOL <= 0) continue;
+
+        // Only update if Jupiter price is newer than last PumpPortal tick
+        // OR if PumpPortal hasn't sent a tick in 3s
+        const ppFresh = pos._lastTickAt && (now - pos._lastTickAt) < 3000;
+        if (ppFresh && pos.currentPrice > 0) continue; // PumpPortal is feeding — don't override
+
+        // Update position price
+        const prevPrice = pos.currentPrice;
+        pos.currentPrice = tokenPriceInSOL;
+        pos._lastTickAt = now;
+        pos._priceSource = 'jupiter';
+        if (pos.priceTickCount === 0) {
+          pos.priceTickCount = 1;
+          // Fix entry price if it was 0 or wildly wrong
+          if (pos.entryPrice <= 0) pos.entryPrice = tokenPriceInSOL;
+        } else {
+          pos.priceTickCount++;
+        }
+        if (tokenPriceInSOL > pos.highPrice) pos.highPrice = tokenPriceInSOL;
+
+        // Feed MCTS with Jupiter price
+        recordMctsTick(mint, tokenPriceInSOL, true);
+        updated++;
+      }
+
+      if (updated > 0 && _pricePollerCycle % 5 === 0) {
+        console.log('[MCHPai] §PRICE_ENGINE: ' + updated + '/' + entries.length + ' positions priced via Jupiter (cycle #' + _pricePollerCycle + ')');
+      }
+    } catch (e) {
+      // Silent fail — Jupiter is a fallback, not critical path
+    } finally {
+      _pricePollerRunning = false;
+    }
+  }
+  setInterval(_pricePoll, 2000); // §FIX: Every 2 seconds (was 5s)
+  setTimeout(_pricePoll, 1000);  // First run 1s after boot (was 3s)
   // §UPGRADE #46: Auto-unsubscribe dead wallets every hour
   setInterval(() => {
     if (typeof WALLET_PERFORMANCE === 'undefined') return;
@@ -13864,10 +13960,17 @@ function posMonitor(){
       queueMicrotask(() => { doSell(mint, _exitDec.reason).finally(() => EXIT_PRIORITY.clearSelling(mint)); });
       continue;
     }
-    // Re-subscribe stuck positions (have entry but stopped getting ticks for 60s)
-    if(pos.priceTickCount>0 && pos._lastTickAt && (now-pos._lastTickAt)>60000){
-      if(S.ws?.readyState===1)S.ws.send(WS_SUB_TOK(mint));
-      pos._lastTickAt=now; // reset so we don't spam
+    // Re-subscribe stuck positions — covers both:
+    // 1. Had ticks but stopped for 30s (was 60s — too long)
+    // 2. Never got ANY ticks for 10s (PumpPortal subscription may have failed)
+    if (pos._lastTickAt && (now - pos._lastTickAt) > 30000) {
+      if (S.ws?.readyState === 1) S.ws.send(WS_SUB_TOK(mint));
+      if (S.ws2?.readyState === 1) S.ws2.send(WS_SUB_TOK(mint));
+      pos._lastTickAt = now; // reset so we don't spam
+    } else if (pos.priceTickCount === 0 && (now - pos.entryTime) > 10000) {
+      if (S.ws?.readyState === 1) S.ws.send(WS_SUB_TOK(mint));
+      if (S.ws2?.readyState === 1) S.ws2.send(WS_SUB_TOK(mint));
+      pos._lastTickAt = now;
     }
     if(!pos.currentPrice||!pos.entryPrice)continue;
     if(pos.currentPrice>pos.highPrice){
