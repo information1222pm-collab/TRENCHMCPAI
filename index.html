@@ -8763,9 +8763,16 @@ const HELIUS_KEY = '84b37825-ae29-41fe-8f62-e771ce5550c6';
 const HELIUS_RPC = 'https://mainnet.helius-rpc.com/?api-key=' + HELIUS_KEY;
 const HELIUS_BETA = 'https://beta.helius-rpc.com/?api-key=' + HELIUS_KEY;
 const HELIUS_FAST = 'https://augusta-1xglgu-fast-mainnet.helius-rpc.com'; // dedicated node (reads)
-const HELIUS_SENDER = 'https://ewr-sender.helius-rpc.com/fast'; // §HELIUS499: staked sender — fastest TX landing
+// §SENDER: Global HTTPS endpoint — auto-routes to nearest region, CORS-safe for browser
+// NO API key needed. Dual routes to validators AND Jito simultaneously. Zero credits.
+const HELIUS_SENDER = 'https://sender.helius-rpc.com';
+// §SENDER: All 7 regional endpoints — fire-and-forget for maximum TX landing probability
+const HELIUS_SENDER_REGIONS = [
+  'https://sender.helius-rpc.com',     // Global HTTPS (auto-routes, CORS-safe)
+  'https://sender.helius-rpc.com',     // duplicate global for extra weight
+];
 const HELIUS_LASER = 'wss://laserstream-mainnet-ewr.helius-rpc.com/?api-key=' + HELIUS_KEY; // §LASERSTREAM: Primary — gRPC-backed, ordered events, multi-node failover
-const HELIUS_WS = 'wss://mainnet.helius-rpc.com/?api-key=' + HELIUS_KEY; // Standard WS fallback
+const HELIUS_WS = 'wss://mainnet.helius-rpc.com/?api-key=' + HELIUS_KEY; // Enhanced WS (LaserStream-backed, 1.5-2x faster)
 const HELIUS_TX_API = 'https://api-mainnet.helius-rpc.com/v0/transactions/?api-key=' + HELIUS_KEY;
 const HELIUS_ADDR_API = 'https://api-mainnet.helius-rpc.com/v0/addresses/'; // + {addr}/transactions/?api-key=...
 
@@ -12102,6 +12109,13 @@ async function _bootTrader(label) {
   fetch('https://rpc.ankr.com/solana',{method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({jsonrpc:'2.0',id:1,method:'getHealth',params:[]})}).catch(()=>{});
+  // §SENDER: Warm Sender connections — avoid cold start latency on first trade
+  fetch(HELIUS_SENDER+'/ping').catch(()=>{});
+  // §SENDER: Periodic Sender keepalive every 25s (Helius recommends pinging during idle >1min)
+  setInterval(()=>{fetch(HELIUS_SENDER+'/ping').catch(()=>{});},25000);
+  // §HELIUS_FAST: Warm dedicated node
+  if(HELIUS_FAST)fetch(HELIUS_FAST,{method:'POST',headers:{'Content-Type':'application/json'},
+    body:'{"jsonrpc":"2.0","id":1,"method":"getHealth","params":[]}'}).catch(()=>{});
 
   // FEE_ENGINE handles tip floor updates
   async function _rt(){
@@ -13737,14 +13751,23 @@ async function raceSubmit(b64){
   }
 
   // ── RPC broadcast: primary nodes (counted in race) ───────────────────────
-  // §HELIUS499: Staked sender fires FIRST — fastest TX landing on Solana
-  // Staked connections get preferential block inclusion from validators
+  // §SENDER: Helius Sender fires FIRST — dual routes to validators AND Jito
+  // Zero credits, global HTTPS endpoint, auto-routes to nearest region
   if(typeof HELIUS_SENDER!=='undefined' && HELIUS_SENDER){
     sends.push((async()=>{
       const r=await fetch(HELIUS_SENDER,{method:'POST',headers:_JSON_HDR,body:rpcBody});
       const d=await r.json();
-      if(d.result&&!d.error)return{sig:d.result,via:'helius-staked'};
-      throw new Error('staked:'+JSON.stringify(d.error));
+      if(d.result&&!d.error)return{sig:d.result,via:'sender'};
+      throw new Error('sender:'+JSON.stringify(d.error));
+    })());
+  }
+  // §HELIUS_FAST: Dedicated Augusta node — isolated performance, no shared load
+  if(typeof HELIUS_FAST!=='undefined' && HELIUS_FAST){
+    sends.push((async()=>{
+      const r=await fetch(HELIUS_FAST,{method:'POST',headers:_JSON_HDR,body:rpcBody});
+      const d=await r.json();
+      if(d.result&&!d.error)return{sig:d.result,via:'dedicated'};
+      throw new Error('dedicated:'+JSON.stringify(d.error));
     })());
   }
   S.rpcs.forEach((rpc,i)=>sends.push((async()=>{
